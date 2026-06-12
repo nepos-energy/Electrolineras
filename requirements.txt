@@ -1,0 +1,7 @@
+ocpp==2.1.0
+websockets
+asyncpg
+python-dotenv
+fastapi
+uvicorn[standard]
+pydantic
