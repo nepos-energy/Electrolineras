@@ -81,6 +81,7 @@ async def on_connect(websocket):
 async def main():
     global db_pool
     logger.info("Conectando a base de datos...")
+    logger.info(f"DEBUG: DATABASE_URL presente = {DATABASE_URL is not None}, longitud = {len(DATABASE_URL) if DATABASE_URL else 0}")
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     logger.info("Base de datos conectada")
     logger.info("Servidor OCPP iniciando en puerto 9000...")
