@@ -220,4 +220,236 @@ async def create_session(
         """
         INSERT INTO sessions (
             charge_point_id, connector_id, tenant_id, user_token,
-            kwh_requested, payment_method, payment_status, se
+            kwh_requested, payment_method, payment_status, session_status,
+            started_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, NOW())
+        RETURNING id, session_status, started_at
+        """,
+        cp_row["id"], body.connector_id, tenant_id, body.user_token,
+        body.kwh_requested, body.payment_method, SessionStatus.PENDING_PAYMENT.value,
+    )
+    logger.info(f"Sesion creada: {row['id']} (tenant={tenant_id})")
+    return {
+        "id": str(row["id"]),
+        "session_status": row["session_status"],
+        "started_at": row["started_at"],
+    }
+
+
+@app.get("/sessions/{session_id}", response_model=SessionResponse)
+async def get_session(
+    session_id: str,
+    tenant_id: str = Depends(get_tenant_id),
+    db: asyncpg.Pool = Depends(get_db),
+):
+    """
+    Devuelve el estado de la sesión + el último meter_value asociado.
+    Pensado para polling desde el Kiosk durante la carga: una sola
+    llamada trae session_status, kwh_delivered y power_kw actuales.
+    """
+    session = await db.fetchrow(
+        """
+        SELECT s.*, cp.ocpp_id as charge_point_ocpp_id
+        FROM sessions s
+        JOIN charge_points cp ON cp.id = s.charge_point_id
+        WHERE s.id = $1 AND s.tenant_id = $2
+        """,
+        session_id, tenant_id,
+    )
+    if not session:
+        raise HTTPException(status_code=404, detail="Sesion no encontrada")
+
+    last_meter = await db.fetchrow(
+        """
+        SELECT kwh, power_kw, voltage, current_a, soc_pct, timestamp
+        FROM meter_values
+        WHERE session_id = $1
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        session_id,
+    )
+
+    return {
+        "id": str(session["id"]),
+        "tenant_id": session["tenant_id"],
+        "charge_point_id": session["charge_point_ocpp_id"],
+        "connector_id": session["connector_id"],
+        "session_status": session["session_status"],
+        "payment_status": session["payment_status"],
+        "payment_method": session["payment_method"],
+        "kwh_requested": session["kwh_requested"],
+        "kwh_delivered": session["kwh_delivered"],
+        "amount_charged": session["amount_charged"],
+        "started_at": session["started_at"],
+        "ended_at": session["ended_at"],
+        "last_meter": dict(last_meter) if last_meter else None,
+    }
+
+
+@app.patch("/sessions/{session_id}")
+async def update_session(
+    session_id: str,
+    body: UpdateSessionRequest,
+    tenant_id: str = Depends(get_tenant_id),
+    db: asyncpg.Pool = Depends(get_db),
+):
+    """
+    Transiciona el estado de una sesión. Valida que la transición sea
+    permitida según la máquina de estados — si no, devuelve 409 Conflict.
+    """
+    current = await db.fetchrow(
+        "SELECT session_status FROM sessions WHERE id = $1 AND tenant_id = $2",
+        session_id, tenant_id,
+    )
+    if not current:
+        raise HTTPException(status_code=404, detail="Sesion no encontrada")
+
+    validate_transition(current["session_status"], body.session_status.value)
+
+    # Si pasa a estado terminal, registrar ended_at
+    extra_set = ""
+    if body.session_status in (SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.TIMEOUT):
+        extra_set = ", ended_at = NOW()"
+
+    row = await db.fetchrow(
+        f"""
+        UPDATE sessions
+        SET session_status = $1 {extra_set}
+        WHERE id = $2 AND tenant_id = $3
+        RETURNING id, session_status, ended_at
+        """,
+        body.session_status.value, session_id, tenant_id,
+    )
+    logger.info(
+        f"Sesion {session_id}: {current['session_status']} -> {body.session_status.value}"
+    )
+    return {
+        "id": str(row["id"]),
+        "session_status": row["session_status"],
+        "ended_at": row["ended_at"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Endpoints — Chargers / Connectors
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/chargers")
+async def list_chargers(
+    tenant_id: str = Depends(get_tenant_id),
+    db: asyncpg.Pool = Depends(get_db),
+):
+    rows = await db.fetch(
+        """
+        SELECT id, ocpp_id, modelo, vendor, status, last_heartbeat, activo
+        FROM charge_points
+        WHERE tenant_id = $1
+        ORDER BY ocpp_id
+        """,
+        tenant_id,
+    )
+    return [dict(r) for r in rows]
+
+
+@app.get("/connectors")
+async def list_connectors(
+    charge_point_id: Optional[str] = None,
+    tenant_id: str = Depends(get_tenant_id),
+    db: asyncpg.Pool = Depends(get_db),
+):
+    if charge_point_id:
+        rows = await db.fetch(
+            """
+            SELECT c.id, c.connector_id, c.tipo, c.status, c.updated_at
+            FROM connectors c
+            JOIN charge_points cp ON cp.id = c.charge_point_id
+            WHERE cp.ocpp_id = $1 AND cp.tenant_id = $2
+            ORDER BY c.connector_id
+            """,
+            charge_point_id, tenant_id,
+        )
+    else:
+        rows = await db.fetch(
+            """
+            SELECT c.id, c.connector_id, c.tipo, c.status, c.updated_at,
+                   cp.ocpp_id as charge_point_id
+            FROM connectors c
+            JOIN charge_points cp ON cp.id = c.charge_point_id
+            WHERE cp.tenant_id = $1
+            ORDER BY cp.ocpp_id, c.connector_id
+            """,
+            tenant_id,
+        )
+    return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Webhook — Pagoplux (placeholder con validación de firma desde T16)
+# ─────────────────────────────────────────────────────────────────────────────
+def verify_pagoplux_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
+    """
+    Valida la firma del webhook de Pagoplux usando HMAC-SHA256.
+
+    NOTA: El algoritmo exacto y el nombre del header dependen de la
+    documentación de Pagoplux — esto es la ESTRUCTURA de validación,
+    que se ajusta en T19 con las specs reales del proveedor. Lo
+    importante es que el endpoint NUNCA procese un webhook sin firma
+    válida, ni siquiera en desarrollo.
+    """
+    if not signature_header:
+        return False
+
+    expected = hmac.new(
+        PAGOPLUX_WEBHOOK_SECRET.encode(),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return hmac.compare_digest(expected, signature_header)
+
+
+@app.post("/webhooks/pagoplux")
+async def pagoplux_webhook(
+    request: Request,
+    x_pagoplux_signature: Optional[str] = Header(default=None),
+    db: asyncpg.Pool = Depends(get_db),
+):
+    """
+    Recibe la confirmación de pago de Pagoplux.
+
+    FLUJO (completo en T19):
+    1. Validar firma (acá, ya implementado)
+    2. Buscar el payment por external_id
+    3. Marcar payment.status = 'confirmed', webhook_received_at = NOW()
+    4. Transicionar session: PENDING_PAYMENT -> PAYMENT_CONFIRMED
+    5. Disparar RemoteStartTransaction al servidor OCPP (T17)
+
+    HOY (T16): solo validación de firma + logging. La lógica de negocio
+    completa se implementa en T19 cuando tengamos las credenciales y
+    el formato real de payload de Pagoplux.
+    """
+    raw_body = await request.body()
+
+    if not verify_pagoplux_signature(raw_body, x_pagoplux_signature):
+        logger.warning("Webhook Pagoplux recibido con firma invalida — rechazado")
+        raise HTTPException(status_code=401, detail="Firma invalida")
+
+    payload = await request.json()
+    logger.info(f"Webhook Pagoplux recibido (firma OK): {payload}")
+
+    # TODO T19: procesar payload real de Pagoplux
+    #   - extraer external_id, status, amount
+    #   - UPDATE payments SET status=..., webhook_received_at=NOW(), raw_webhook=...
+    #   - validate_transition + UPDATE sessions SET session_status='PAYMENT_CONFIRMED'
+    #   - llamar al servidor OCPP para RemoteStartTransaction
+
+    return {"received": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Health check
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "neposcharge-api", "time": datetime.now(timezone.utc).isoformat()}
